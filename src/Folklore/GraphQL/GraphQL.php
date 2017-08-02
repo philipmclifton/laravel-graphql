@@ -1,30 +1,81 @@
 <?php namespace Folklore\GraphQL;
 
-use GraphQL\GraphQL as GraphQLBase;
-use GraphQL\Schema;
-use GraphQL\Error\Error;
-
-use GraphQL\Type\Definition\ObjectType;
-
 use Folklore\GraphQL\Error\ValidationError;
-
-use Folklore\GraphQL\Exception\TypeNotFound;
-use Folklore\GraphQL\Exception\SchemaNotFound;
-
 use Folklore\GraphQL\Events\SchemaAdded;
 use Folklore\GraphQL\Events\TypeAdded;
+use Folklore\GraphQL\Exception\SchemaNotFound;
+use Folklore\GraphQL\Exception\TypeNotFound;
+use GraphQL\Error\Error;
+use GraphQL\GraphQL as GraphQLBase;
+use GraphQL\Schema;
+use GraphQL\Type\Definition\ObjectType;
 
 class GraphQL
 {
     protected $app;
-    
-    protected $schemas = [];
-    protected $types = [];
+
+    protected $schemas        = [];
+
+    protected $types          = [];
+
     protected $typesInstances = [];
-    
+
     public function __construct($app)
     {
         $this->app = $app;
+    }
+
+    public static function formatError(Error $e)
+    {
+        $error = [
+            'message' => $e->getMessage(),
+        ];
+
+        $locations = $e->getLocations();
+        if ( ! empty($locations)) {
+            $error['locations'] = array_map(function ($loc) {
+                return $loc->toArray();
+            }, $locations);
+        }
+
+        $previous = $e->getPrevious();
+        if ($previous && $previous instanceof ValidationError) {
+            $error['validation'] = $previous->getValidatorMessages();
+        }
+
+        return $error;
+    }
+
+    public function query($query, $variables = [], $opts = [])
+    {
+        $result = $this->queryAndReturnResult($query, $variables, $opts);
+
+        if ( ! empty($result->errors)) {
+            $errorFormatter = config('graphql.error_formatter', [self::class, 'formatError']);
+
+            return [
+                'data'   => $result->data,
+                'errors' => array_map($errorFormatter, $result->errors),
+            ];
+        } else {
+            return [
+                'data' => $result->data,
+            ];
+        }
+    }
+
+    public function queryAndReturnResult($query, $variables = [], $opts = [])
+    {
+        $root          = array_get($opts, 'root', null);
+        $context       = array_get($opts, 'context', null);
+        $schemaName    = array_get($opts, 'schema', null);
+        $operationName = array_get($opts, 'operationName', null);
+
+        $schema = $this->schema($schemaName);
+
+        $result = GraphQLBase::executeAndReturnResult($schema, $query, $root, $context, $variables, $operationName);
+
+        return $result;
     }
 
     public function schema($schema = null)
@@ -32,77 +83,63 @@ class GraphQL
         if ($schema instanceof Schema) {
             return $schema;
         }
-        
+
         $this->clearTypeInstances();
-        
-        $schemaName = is_string($schema) ? $schema:config('graphql.schema', 'default');
-        
-        if (!is_array($schema) && !isset($this->schemas[$schemaName])) {
-            throw new SchemaNotFound('Type '.$schemaName.' not found.');
+
+        $schemaName = is_string($schema) ? $schema : config('graphql.schema', 'default');
+
+        if ( ! is_array($schema) && ! isset($this->schemas[ $schemaName ])) {
+            throw new SchemaNotFound('Type ' . $schemaName . ' not found.');
         }
-        
-        $schema = is_array($schema) ? $schema:$this->schemas[$schemaName];
-        
-        $schemaQuery = array_get($schema, 'query', []);
-        $schemaMutation = array_get($schema, 'mutation', []);
+
+        $schema = is_array($schema) ? $schema : $this->schemas[ $schemaName ];
+
+        $schemaQuery        = array_get($schema, 'query', []);
+        $schemaMutation     = array_get($schema, 'mutation', []);
         $schemaSubscription = array_get($schema, 'subscription', []);
-        $schemaTypes = array_get($schema, 'types', []);
-        
+        $schemaTypes        = array_get($schema, 'types', []);
+
         //Get the types either from the schema, or the global types.
         $types = [];
         if (sizeof($schemaTypes)) {
             foreach ($schemaTypes as $name => $type) {
-                $objectType = $this->objectType($type, is_numeric($name) ? []:[
-                    'name' => $name
+                $objectType                    = $this->objectType($type, is_numeric($name) ? [] : [
+                    'name' => $name,
                 ]);
-                $this->typesInstances[$name] = $objectType;
-                $types[] = $objectType;
+                $this->typesInstances[ $name ] = $objectType;
+                $types[]                       = $objectType;
             }
         } else {
             foreach ($this->types as $name => $type) {
                 $types[] = $this->type($name);
             }
         }
-        
+
         $query = $this->objectType($schemaQuery, [
-            'name' => 'Query'
+            'name' => 'Query',
         ]);
-        
+
         $mutation = $this->objectType($schemaMutation, [
-            'name' => 'Mutation'
+            'name' => 'Mutation',
         ]);
-        
+
         $subscription = $this->objectType($schemaSubscription, [
-            'name' => 'Subscription'
+            'name' => 'Subscription',
         ]);
-        
+
         return new Schema([
-            'query' => $query,
-            'mutation' => !empty($schemaMutation) ? $mutation : null,
-            'subscription' => !empty($schemaSubscription) ? $subscription : null,
-            'types' => $types
+            'query'        => $query,
+            'mutation'     => ! empty($schemaMutation) ? $mutation : null,
+            'subscription' => ! empty($schemaSubscription) ? $subscription : null,
+            'types'        => $types,
         ]);
     }
-    
-    public function type($name, $fresh = false)
+
+    protected function clearTypeInstances()
     {
-        if (!isset($this->types[$name])) {
-            throw new TypeNotFound('Type '.$name.' not found.');
-        }
-        
-        if (!$fresh && isset($this->typesInstances[$name])) {
-            return $this->typesInstances[$name];
-        }
-        
-        $class = $this->types[$name];
-        $type = $this->objectType($class, [
-            'name' => $name
-        ]);
-        $this->typesInstances[$name] = $type;
-        
-        return $type;
+        $this->typesInstances = [];
     }
-    
+
     public function objectType($type, $opts = [])
     {
         // If it's already an ObjectType, just update properties and return it.
@@ -115,8 +152,8 @@ class GraphQL
                 if (property_exists($objectType, $key)) {
                     $objectType->{$key} = $value;
                 }
-                if (isset($objectType->config[$key])) {
-                    $objectType->config[$key] = $value;
+                if (isset($objectType->config[ $key ])) {
+                    $objectType->config[ $key ] = $value;
                 }
             }
         } elseif (is_array($type)) {
@@ -124,165 +161,134 @@ class GraphQL
         } else {
             $objectType = $this->buildObjectTypeFromClass($type, $opts);
         }
-        
+
         return $objectType;
     }
-    
-    public function query($query, $variables = [], $opts = [])
-    {
-        $result = $this->queryAndReturnResult($query, $variables, $opts);
-        
-        if (!empty($result->errors)) {
-            $errorFormatter = config('graphql.error_formatter', [self::class, 'formatError']);
-            
-            return [
-                'data' => $result->data,
-                'errors' => array_map($errorFormatter, $result->errors)
-            ];
-        } else {
-            return [
-                'data' => $result->data
-            ];
-        }
-    }
-    
-    public function queryAndReturnResult($query, $variables = [], $opts = [])
-    {
-        $root = array_get($opts, 'root', null);
-        $context = array_get($opts, 'context', null);
-        $schemaName = array_get($opts, 'schema', null);
-        $operationName = array_get($opts, 'operationName', null);
-        
-        $schema = $this->schema($schemaName);
-        
-        $result = GraphQLBase::executeAndReturnResult($schema, $query, $root, $context, $variables, $operationName);
-        
-        return $result;
-    }
-    
-    public function addTypes($types)
-    {
-        foreach ($types as $name => $type) {
-            $this->addType($type, is_numeric($name) ? null:$name);
-        }
-    }
-    
-    public function addType($class, $name = null)
-    {
-        $name = $this->getTypeName($class, $name);
-        $this->types[$name] = $class;
-        
-        event(new TypeAdded($class, $name));
-    }
-    
-    public function addSchema($name, $schema)
-    {
-        $this->schemas[$name] = $schema;
-        
-        event(new SchemaAdded($schema, $name));
-    }
-    
-    public function clearType($name)
-    {
-        if (isset($this->types[$name])) {
-            unset($this->types[$name]);
-        }
-    }
-    
-    public function clearSchema($name)
-    {
-        if (isset($this->schemas[$name])) {
-            unset($this->schemas[$name]);
-        }
-    }
-    
-    public function clearTypes()
-    {
-        $this->types = [];
-    }
-    
-    public function clearSchemas()
-    {
-        $this->schemas = [];
-    }
-    
-    public function getTypes()
-    {
-        return $this->types;
-    }
-    
-    public function getSchemas()
-    {
-        return $this->schemas;
-    }
-    
-    protected function clearTypeInstances()
-    {
-        $this->typesInstances = [];
-    }
-    
-    protected function buildObjectTypeFromClass($type, $opts = [])
-    {
-        if (!is_object($type)) {
-            $type = $this->app->make($type);
-        }
-        
-        foreach ($opts as $key => $value) {
-            $type->{$key} = $value;
-        }
-        
-        return $type->toType();
-    }
-    
+
     protected function buildObjectTypeFromFields($fields, $opts = [])
     {
         $typeFields = [];
         foreach ($fields as $name => $field) {
             if (is_string($field)) {
-                $field = $this->app->make($field);
-                $name = is_numeric($name) ? $field->name:$name;
+                $field       = $this->app->make($field);
+                $name        = is_numeric($name) ? $field->name : $name;
                 $field->name = $name;
-                $field = $field->toArray();
+                $field       = $field->toArray();
             } else {
-                $name = is_numeric($name) ? $field['name']:$name;
+                $name          = is_numeric($name) ? $field['name'] : $name;
                 $field['name'] = $name;
             }
-            $typeFields[$name] = $field;
+            $typeFields[ $name ] = $field;
         }
-        
+
         return new ObjectType(array_merge([
-            'fields' => $typeFields
+            'fields' => $typeFields,
         ], $opts));
     }
-    
+
+    protected function buildObjectTypeFromClass($type, $opts = [])
+    {
+        if ( ! is_object($type)) {
+            $type = $this->app->make($type);
+        }
+
+        foreach ($opts as $key => $value) {
+            $type->{$key} = $value;
+        }
+
+        return $type->toType();
+    }
+
+    public function type($name, $schema = false, $fresh = false)
+    {
+        if ($schema) {
+            if ( ! isset($this->schemas[ $schema ]['types'][ $name ])) {
+                throw new TypeNotFound('Schema Type ' . $name . ' not found.');
+            }
+            $class = $this->schemas[ $schema ]['types'][ $name ];
+        } else {
+            if ( ! isset($this->types[ $name ])) {
+                throw new TypeNotFound('Type ' . $name . ' not found.');
+            }
+            $class = $this->types[ $name ];
+        }
+
+        if ( ! $fresh && isset($this->typesInstances[ $name ])) {
+            return $this->typesInstances[ $name ];
+        }
+
+        $type                          = $this->objectType($class, [
+            'name' => $name,
+        ]);
+        $this->typesInstances[ $name ] = $type;
+
+        return $type;
+    }
+
+    public function addTypes($types)
+    {
+        foreach ($types as $name => $type) {
+            $this->addType($type, is_numeric($name) ? null : $name);
+        }
+    }
+
+    public function addType($class, $name = null)
+    {
+        $name                 = $this->getTypeName($class, $name);
+        $this->types[ $name ] = $class;
+
+        event(new TypeAdded($class, $name));
+    }
+
     protected function getTypeName($class, $name = null)
     {
         if ($name) {
             return $name;
         }
-        
-        $type = is_object($class) ? $class:$this->app->make($class);
+
+        $type = is_object($class) ? $class : $this->app->make($class);
+
         return $type->name;
     }
-    
-    public static function formatError(Error $e)
+
+    public function addSchema($name, $schema)
     {
-        $error = [
-            'message' => $e->getMessage()
-        ];
-        
-        $locations = $e->getLocations();
-        if (!empty($locations)) {
-            $error['locations'] = array_map(function ($loc) {
-                return $loc->toArray();
-            }, $locations);
+        $this->schemas[ $name ] = $schema;
+
+        event(new SchemaAdded($schema, $name));
+    }
+
+    public function clearType($name)
+    {
+        if (isset($this->types[ $name ])) {
+            unset($this->types[ $name ]);
         }
-        
-        $previous = $e->getPrevious();
-        if ($previous && $previous instanceof ValidationError) {
-            $error['validation'] = $previous->getValidatorMessages();
+    }
+
+    public function clearSchema($name)
+    {
+        if (isset($this->schemas[ $name ])) {
+            unset($this->schemas[ $name ]);
         }
-        
-        return $error;
+    }
+
+    public function clearTypes()
+    {
+        $this->types = [];
+    }
+
+    public function clearSchemas()
+    {
+        $this->schemas = [];
+    }
+
+    public function getTypes()
+    {
+        return $this->types;
+    }
+
+    public function getSchemas()
+    {
+        return $this->schemas;
     }
 }
