@@ -52,6 +52,8 @@ class GraphQL
 
         if ( ! empty($result->errors)) {
             $errorFormatter = config('graphql.error_formatter', [self::class, 'formatError']);
+            
+            $result->errors = array_unique($result->errors);
 
             return [
                 'data'   => $result->data,
